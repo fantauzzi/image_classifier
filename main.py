@@ -10,6 +10,8 @@ import numpy as np
 AUTOTUNE = tf.data.AUTOTUNE
 image_size = (224, 224)
 labels = {0: 'rock', 1: 'paper', 2: 'scissors'}
+project = 'baseline'
+computation_path = 'computation/' + project
 
 
 def show_samples(dataset, n_rows, n_cols, title):
@@ -75,6 +77,9 @@ def main():
     val_p = .2
     data_dir = '/mnt/storage/datasets'
     preprocessed_dir = data_dir + '/rock_paper_scissors/preprocessed'
+    mispredicted_dir = data_dir + '/rock_paper_scissors/mispredicted'
+    if not Path(mispredicted_dir).is_dir():
+        Path(mispredicted_dir).mkdir(parents=True)
 
     dev_ds, dev_ds_info = tfds.load('rock_paper_scissors',
                                     split='train',
@@ -104,6 +109,9 @@ def main():
 
     dev_metadata = compile_metadata(dev_ds, preprocessed_dir + '/dev')
     test_metadata = compile_metadata(test_ds, preprocessed_dir + '/test')
+    n_classes = len(dev_metadata['y'].unique())
+    assert len(test_metadata['y'].unique()) == n_classes
+    print(f'Samples in the dataset belong to one of {n_classes} classes')
 
     def save_image(sample, filepath):
         image = sample['image']
@@ -162,33 +170,117 @@ def main():
                            shuffle=False,
                            batch_size=test_batch_size)
 
+    test_ds = make_pipeline(filepaths=test_metadata['x'],
+                            y=test_metadata['y'],
+                            shuffle=False,
+                            batch_size=test_batch_size)
+
+    """
     show_samples(train_ds, 4, 4, title='From the training set')
     show_samples(val_ds, 4, 8, title='From the validation set')
+    """
 
     # Another (slower) way to compute mean and variance across the images, commented out
-    """images = np.zeros(shape=(len(train_metadata), image_size[0], image_size[1], 3), dtype=float)
+    """
+    images = np.zeros(shape=(len(train_metadata), image_size[0], image_size[1], 3), dtype=float)
     for i, file_name in enumerate(train_metadata['x']):
         images[i] = plt.imread(file_name)
     mean_by_pixel = np.mean(images, axis=(0,1,2))
     var_by_pixel = np.var(images, axis=(0, 1, 2))
-    print(mean_by_pixel, var_by_pixel)
-    del images"""
+    del images
+    """
 
-    stats_pipeline = tf.data.Dataset.from_tensor_slices((train_metadata['x'],))
-    stats_pipeline = stats_pipeline.map(load_image2, num_parallel_calls=tf.data.AUTOTUNE)
-    stats_pipeline = stats_pipeline.map(lambda image: tf.cast(image, dtype=tf.float32), num_parallel_calls=AUTOTUNE)
-    stats_pipeline = stats_pipeline.batch(batch_size=len(train_metadata))
-    stats_pipeline = stats_pipeline.map(lambda image: image / 255.)
-    stats_pipeline = stats_pipeline.prefetch(buffer_size=AUTOTUNE)
-    big_batch = next(iter(stats_pipeline))
-    assert len(big_batch) == train_ds_size
-    mean_by_pixel = tf.math.reduce_mean(big_batch, axis=(0,1,2))
-    var_by_pixel = tf.math.reduce_variance(big_batch, axis=(0,1,2))
-    del stats_pipeline, big_batch
+    def compute_images_stats(filepaths):
+        stats_pipeline = tf.data.Dataset.from_tensor_slices((filepaths,))
+        stats_pipeline = stats_pipeline.map(load_image2, num_parallel_calls=tf.data.AUTOTUNE)
+        stats_pipeline = stats_pipeline.map(lambda image: tf.cast(image, dtype=tf.float32), num_parallel_calls=AUTOTUNE)
+        stats_pipeline = stats_pipeline.batch(batch_size=len(train_metadata))
+        stats_pipeline = stats_pipeline.map(lambda image: image / 255.)
+        stats_pipeline = stats_pipeline.prefetch(buffer_size=AUTOTUNE)
+        big_batch = next(iter(stats_pipeline))
+        assert len(big_batch) == train_ds_size
+        mean_by_pixel = tf.math.reduce_mean(big_batch, axis=(0, 1, 2))
+        var_by_pixel = tf.math.reduce_variance(big_batch, axis=(0, 1, 2))
+        return mean_by_pixel, var_by_pixel
+
+    mean_by_pixel, var_by_pixel = compute_images_stats(train_metadata['x'])
 
     print(f'Computed mean {mean_by_pixel.numpy()} and variance {var_by_pixel.numpy()} for the training dataset.')
-    input()
+
+    def make_model_EfficientNetB0(hp, n_classes, dataset_mean, dataset_var, bias_init):
+
+        # The NN expects image pixels to be encoded in the range [0, 255]
+        base_model = tf.keras.applications.EfficientNetB0(include_top=False,
+                                                          weights='imagenet',
+                                                          pooling=None,
+                                                          input_shape=image_size + (3,),
+                                                          classes=n_classes)
+
+        preprocess_input = tf.keras.applications.efficientnet.preprocess_input
+        base_model.trainable = False
+        assert base_model.layers[2].name == 'normalization'
+        base_model.layers[2].mean.assign(dataset_mean)
+        base_model.layers[2].variance.assign(dataset_var)
+        inputs = tf.keras.Input(shape=image_size + (3,))
+        x = preprocess_input(inputs)
+        x = base_model(x, training=False)
+        x = tf.keras.layers.GlobalAveragePooling2D()(x)
+        bias_initializer = tf.keras.initializers.Constant(bias_init) if bias_init is not None else None
+        outputs = tf.keras.layers.Dense(n_classes, bias_initializer=bias_initializer)(x)
+        model = tf.keras.Model(inputs, outputs)
+        if n_classes > 2:
+            loss = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+            selection_metric = tf.keras.metrics.SparseCategoricalAccuracy(name='sparse_categorical_accuracy')
+        else:
+            loss = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+            selection_metric = tf.keras.metrics.BinaryAccuracy(name='binary_accuracy')
+        model.compile(optimizer=tf.keras.optimizers.Adam(lr=3e-4),
+                      loss=loss,
+                      metrics=[selection_metric])
+        return model
+
+    classes_freq = np.array(train_metadata['y'].value_counts().sort_index(), dtype=float) / len(train_metadata)
+    bias_init = np.log(classes_freq / (1 - classes_freq))
+    model = make_model_EfficientNetB0(hp=None,
+                                      n_classes=3,
+                                      dataset_mean=mean_by_pixel,
+                                      dataset_var=var_by_pixel,
+                                      bias_init=bias_init)
+    model.summary()
+    tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=computation_path + '/logs')
+    history = model.fit(x=train_ds,
+                        validation_data=val_ds,
+                        epochs=10,
+                        verbose=1,
+                        callbacks=[tensorboard_cb],
+                        shuffle=False)
+
+    test_results = model.evaluate(x=test_ds,
+                                  verbose=1,
+                                  return_dict=True)
+    print(test_results)
+
+    inference_model = tf.keras.Sequential([model, tf.keras.layers.Softmax()])
+    test_predict_proba = inference_model.predict(test_ds)
+    test_metadata['prediction'] = np.argmax(test_predict_proba, axis=1)
+
+    def duplicate_if_mispredicted(item):
+        if item['y'] != item['prediction']:
+            destination = f"{mispredicted_dir}/{Path(item['x']).name}"
+            Path(item['x']).link_to(destination)
+
+    test_metadata.apply(duplicate_if_mispredicted, axis=1)
+    pass
 
 
 if __name__ == '__main__':
     main()
+
+"""TODO:
+
+switch to different color space
+Take validation from test
+call adapt()
+should I encode the pixels of the dataset as int or float?
+
+"""
