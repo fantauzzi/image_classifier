@@ -16,6 +16,7 @@ project = 'baseline'
 computation_path = 'computations/' + project
 model_checkpoint = computation_path + '/models/best_base.hdf5'
 model_checkpoint_ft = computation_path + '/models/best_ft.hdf5'
+seed = 42
 
 
 def show_samples(dataset, n_rows, n_cols, title, use_hsv=False):
@@ -108,14 +109,32 @@ def count_weights(layer_or_model):
     return trainables_weights, non_trainable_weights, total_weights
 
 
+data_augmentation = tf.keras.Sequential(
+    [
+        tf.keras.layers.experimental.preprocessing.RandomZoom(height_factor=(-.1, .2), fill_mode='nearest', seed=seed),
+        tf.keras.layers.experimental.preprocessing.RandomRotation(10 / 360, fill_mode='nearest', seed=seed),
+        tf.keras.layers.experimental.preprocessing.RandomTranslation(height_factor=.1,
+                                                                     width_factor=.1,
+                                                                     fill_mode='nearest',
+                                                                     seed=seed)
+
+    ], name='augmentation'
+)
+
+
+def shuffle_dataframe(df, seed=None):
+    df = df.sample(n=len(df), replace=False, random_state=seed)
+    return df
+
+
 def main():
     train_batch_size = 16
     test_batch_size = 32
-    seed = 42
     data_dir = '/mnt/storage/datasets'
     preprocessed_dir = data_dir + '/rock_paper_scissors/preprocessed'
     mispredicted_dir = data_dir + '/rock_paper_scissors/mispredicted'
     mispredicted_dir_ft = data_dir + '/rock_paper_scissors/mispredicted_ft'
+    augmented_dir = data_dir + '/rock_paper_scissors/augmented'
     str_time = datetime.datetime.now().strftime("%m%d-%H%M%S")
 
     # Empty or make the directories for mis-predicted samples. Create them if they don't exist
@@ -192,6 +211,43 @@ def main():
     print('Count of samples per class in original test set:')
     print(test_metadata['y'].value_counts().sort_index())
 
+    def make_augmented_filepath(filepath, i):
+        stem = Path(filepath).stem
+        res = '{}/{}_{:02d}.png'.format(augmented_dir, stem, i)
+        return res
+
+    def load_augment_save(filepath, y, augmented_filepath):
+        image, _ = load_image(filepath, y)
+        image = tf.expand_dims(image, axis=0)
+        augmented = data_augmentation(image)
+        augmented = tf.squeeze(augmented, axis=0)
+        augmented_png = tf.io.encode_png(augmented)
+        tf.io.write_file(augmented_filepath, augmented_png)
+        return filepath, y, augmented_filepath
+
+    def augment(metadata, ratio):
+        augmented_all = None  # Just to avoid bogus warning from IntelliJ
+        for i in range(ratio):
+            augmented = metadata.copy()
+            augmented['augmented'] = augmented['x'].map(lambda filepath: make_augmented_filepath(filepath, i))
+            augmented_all = augmented if i == 0 else pd.concat([augmented_all, augmented], ignore_index=True)
+
+        ds = tf.data.Dataset.from_tensor_slices((augmented_all['x'], augmented_all['y'], augmented_all['augmented']))
+        ds = ds.map(load_augment_save, num_parallel_calls=AUTOTUNE)
+        ds = ds.batch(batch_size=32, drop_remainder=False)
+        ds = ds.prefetch(buffer_size=AUTOTUNE)
+
+        ds_iter = iter(ds)
+        for _ in ds_iter:
+            pass
+        augmented_all.drop(['x'], axis=1, inplace=True)
+        augmented_all.rename({'augmented': 'x'}, axis=1, inplace=True)
+        augmented_all = pd.concat([metadata, augmented_all], ignore_index=True)
+        return augmented_all
+
+    train_metadata = augment(train_metadata, ratio=2)
+    train_metadata = shuffle_dataframe(train_metadata, seed=seed)
+
     # Split the test dataset in two, making a validation and a test set
     val_ds_size, test_ds_size = test_ds_size // 2, test_ds_size - test_ds_size // 2
 
@@ -225,11 +281,9 @@ def main():
                             hsv_color_space=True,
                             batch_size=test_batch_size)
 
-    """
     show_samples(train_ds, 4, 4, title='From the training set', use_hsv=True)
     show_samples(val_ds, 4, 8, title='From the validation set', use_hsv=True)
     show_samples(test_ds, 4, 8, title='From the test set', use_hsv=True)
-    """
 
     def compile_model(model, n_classes, learning_rate):
         if n_classes > 2:
@@ -242,18 +296,6 @@ def main():
         model.compile(optimizer=tf.keras.optimizers.Adam(lr=3e-4),
                       loss=loss,
                       metrics=[selection_metric])
-
-    data_augmentation = tf.keras.Sequential(
-        [
-            tf.keras.layers.experimental.preprocessing.RandomZoom(height_factor=.2, fill_mode='nearest', seed=seed),
-            # tf.keras.layers.experimental.preprocessing.RandomRotation(0.18, fill_mode='nearest', seed=seed),
-            tf.keras.layers.experimental.preprocessing.RandomTranslation(height_factor=.1,
-                                                                         width_factor=.1,
-                                                                         fill_mode='nearest',
-                                                                         seed=seed)
-
-        ], name='augmentation'
-    )
 
     def make_model_EfficientNetB0(hp, n_classes, dataset, bias_init, augment=False):
         base_model = tf.keras.applications.EfficientNetB0(include_top=False,
@@ -296,7 +338,7 @@ def main():
                                       n_classes=3,
                                       dataset=images_only_ds,
                                       bias_init=bias_init,
-                                      augment=True)
+                                      augment=False)
     del images_only_ds  # Not needed anymore, can free memory
     model.summary()
 
@@ -317,7 +359,7 @@ def main():
 
     def prepare_for_fine_tuning_efficientnetb0(model, n_classes, learning_rate):
         for layer in model.layers:
-            if layer.name =='efficientnetb0':
+            if layer.name == 'efficientnetb0':
                 base_model = layer
                 break
         else:
@@ -332,10 +374,10 @@ def main():
             if match is not None:
                 block_ends.append(i)
                 block_end_names.append(layer.name)
-        last_frozen_layer = 3  # from 0 to 5, included
+        last_frozen_layer = 5  # from 0 to 5, included
 
-        """for i in range(block_ends[last_frozen_layer]):
-            base_model.layers[i].trainable = False"""
+        for i in range(block_ends[last_frozen_layer]):
+            base_model.layers[i].trainable = False
 
         compile_model(base_model, n_classes=n_classes, learning_rate=learning_rate)
 
@@ -379,7 +421,9 @@ if __name__ == '__main__':
     main()
 
 """TODO:
-Do image augmentation
+If augmented images already available, do not re-do them
+Retry with grayscale
+Try a different pre-trained NN
 Parallel feeding to the NN of multiple batches
 Hyper-parameters tuning
 Try variable training rates
