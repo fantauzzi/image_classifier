@@ -214,12 +214,12 @@ def main():
     if not np.all([Path(filepath).is_file() for filepath in train_metadata['x']]):
         prepr_train = preprocess_dataset(dataset=orig_train_ds,
                                          filepaths=train_metadata['x'].to_numpy(),
-                                         convert_to_grayscale=True)
+                                         convert_to_grayscale=False)
         print(f'Saved {prepr_train} pre-processed dev. images in {preprocessed_dir}')
     if not np.all([Path(filepath).is_file() for filepath in test_metadata['x']]):
         prepr_test = preprocess_dataset(dataset=orig_test_ds,
                                         filepaths=test_metadata['x'].to_numpy(),
-                                        convert_to_grayscale=True)
+                                        convert_to_grayscale=False)
         print(f'Saved {prepr_test} pre-processed test images {preprocessed_dir}')
 
     train_ds_size = orig_train_ds_info.splits['train'].num_examples
@@ -445,6 +445,7 @@ if __name__ == '__main__':
     main()
 
 """TODO:
+Correctly try also (colour) RGB and HSV
 Maximize images dynamic range
 Try a different pre-trained NN
 Parallel feeding to the NN of multiple batches
