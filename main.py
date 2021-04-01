@@ -51,11 +51,21 @@ def load_image(filepath, y):
     return image, y
 
 
-def resize_image(sample, y):
+def resize_and_convert_to_int_image(sample, y):
     image = sample['image']
     image = tf.image.resize(image, size=image_size)
     image = tf.math.round(image)
     image = tf.cast(image, dtype=tf.uint8)
+    sample['image'] = image
+    return sample, y
+
+
+def image_to_grayscale(sample, y):
+    image = sample['image']
+    image = tf.image.rgb_to_grayscale(image)
+    image = tf.squeeze(image)
+    image = tf.cast(image, dtype=tf.float32)
+    image = tf.stack([image, image, image], axis=2)
     sample['image'] = image
     return sample, y
 
@@ -74,6 +84,8 @@ def make_pipeline(filepaths, y, shuffle, batch_size, hsv_color_space=True, seed=
     ds = ds.map(load_image, num_parallel_calls=AUTOTUNE)
     if hsv_color_space:
         ds = ds.map(lambda image, y: (convert_to_hsv(image), y), num_parallel_calls=AUTOTUNE)
+    else:
+        ds = ds.map(lambda image, y: (tf.cast(image, dtype=tf.float32) / 255., y))
     ds = ds.batch(batch_size=batch_size, drop_remainder=False)
     if not shuffle:
         ds = ds.cache()
@@ -111,8 +123,9 @@ def count_weights(layer_or_model):
 
 data_augmentation = tf.keras.Sequential(
     [
-        tf.keras.layers.experimental.preprocessing.RandomZoom(height_factor=(-.1, .2), fill_mode='nearest', seed=seed),
-        tf.keras.layers.experimental.preprocessing.RandomRotation(10 / 360, fill_mode='nearest', seed=seed),
+        tf.keras.layers.experimental.preprocessing.RandomContrast(factor=.2, seed=seed),
+        tf.keras.layers.experimental.preprocessing.RandomZoom(height_factor=(-.1, .3), fill_mode='nearest', seed=seed),
+        tf.keras.layers.experimental.preprocessing.RandomRotation(15 / 360, fill_mode='nearest', seed=seed),
         tf.keras.layers.experimental.preprocessing.RandomTranslation(height_factor=.1,
                                                                      width_factor=.1,
                                                                      fill_mode='nearest',
@@ -136,6 +149,8 @@ def main():
     mispredicted_dir_ft = data_dir + '/rock_paper_scissors/mispredicted_ft'
     augmented_dir = data_dir + '/rock_paper_scissors/augmented'
     str_time = datetime.datetime.now().strftime("%m%d-%H%M%S")
+    use_hsv = False
+    augmentation_ratio = 3
 
     # Empty or make the directories for mis-predicted samples. Create them if they don't exist
     for path in (mispredicted_dir, mispredicted_dir_ft):
@@ -181,10 +196,12 @@ def main():
         tf.io.write_file(filename=filepath[0], contents=image)
         return sample, filepath
 
-    def preprocess_dataset(dataset, filepaths):
+    def preprocess_dataset(dataset, filepaths, convert_to_grayscale=False):
         filepaths_ds = tf.data.Dataset.from_tensor_slices((filepaths,))
         ds = tf.data.Dataset.zip((dataset, filepaths_ds))
-        ds = ds.map(resize_image, num_parallel_calls=AUTOTUNE)
+        if convert_to_grayscale:
+            ds = ds.map(image_to_grayscale, num_parallel_calls=AUTOTUNE)
+        ds = ds.map(resize_and_convert_to_int_image, num_parallel_calls=AUTOTUNE)
         ds = ds.map(save_image, num_parallel_calls=AUTOTUNE)
         ds = ds.prefetch(buffer_size=AUTOTUNE)
 
@@ -195,10 +212,14 @@ def main():
         return count + 1
 
     if not np.all([Path(filepath).is_file() for filepath in train_metadata['x']]):
-        prepr_train = preprocess_dataset(dataset=orig_train_ds, filepaths=train_metadata['x'].to_numpy())
+        prepr_train = preprocess_dataset(dataset=orig_train_ds,
+                                         filepaths=train_metadata['x'].to_numpy(),
+                                         convert_to_grayscale=True)
         print(f'Saved {prepr_train} pre-processed dev. images in {preprocessed_dir}')
     if not np.all([Path(filepath).is_file() for filepath in test_metadata['x']]):
-        prepr_test = preprocess_dataset(dataset=orig_test_ds, filepaths=test_metadata['x'].to_numpy())
+        prepr_test = preprocess_dataset(dataset=orig_test_ds,
+                                        filepaths=test_metadata['x'].to_numpy(),
+                                        convert_to_grayscale=True)
         print(f'Saved {prepr_test} pre-processed test images {preprocessed_dir}')
 
     train_ds_size = orig_train_ds_info.splits['train'].num_examples
@@ -232,20 +253,23 @@ def main():
             augmented['augmented'] = augmented['x'].map(lambda filepath: make_augmented_filepath(filepath, i))
             augmented_all = augmented if i == 0 else pd.concat([augmented_all, augmented], ignore_index=True)
 
-        ds = tf.data.Dataset.from_tensor_slices((augmented_all['x'], augmented_all['y'], augmented_all['augmented']))
-        ds = ds.map(load_augment_save, num_parallel_calls=AUTOTUNE)
-        ds = ds.batch(batch_size=32, drop_remainder=False)
-        ds = ds.prefetch(buffer_size=AUTOTUNE)
+        if not np.all([Path(filepath).is_file() for filepath in augmented_all['augmented']]):
+            ds = tf.data.Dataset.from_tensor_slices(
+                (augmented_all['x'], augmented_all['y'], augmented_all['augmented']))
+            ds = ds.map(load_augment_save, num_parallel_calls=AUTOTUNE)
+            ds = ds.batch(batch_size=32, drop_remainder=False)
+            ds = ds.prefetch(buffer_size=AUTOTUNE)
 
-        ds_iter = iter(ds)
-        for _ in ds_iter:
-            pass
+            ds_iter = iter(ds)
+            for _ in ds_iter:
+                pass
+
         augmented_all.drop(['x'], axis=1, inplace=True)
         augmented_all.rename({'augmented': 'x'}, axis=1, inplace=True)
         augmented_all = pd.concat([metadata, augmented_all], ignore_index=True)
         return augmented_all
 
-    train_metadata = augment(train_metadata, ratio=2)
+    train_metadata = augment(train_metadata, ratio=augmentation_ratio)
     train_metadata = shuffle_dataframe(train_metadata, seed=seed)
 
     # Split the test dataset in two, making a validation and a test set
@@ -266,24 +290,24 @@ def main():
                              y=train_metadata['y'],
                              shuffle=True,
                              batch_size=train_batch_size,
-                             hsv_color_space=True,
+                             hsv_color_space=use_hsv,
                              seed=seed)
 
     val_ds = make_pipeline(filepaths=val_metadata['x'],
                            y=val_metadata['y'],
                            shuffle=False,
-                           hsv_color_space=True,
+                           hsv_color_space=use_hsv,
                            batch_size=test_batch_size)
 
     test_ds = make_pipeline(filepaths=test_metadata['x'],
                             y=test_metadata['y'],
                             shuffle=False,
-                            hsv_color_space=True,
+                            hsv_color_space=use_hsv,
                             batch_size=test_batch_size)
 
-    show_samples(train_ds, 4, 4, title='From the training set', use_hsv=True)
-    show_samples(val_ds, 4, 8, title='From the validation set', use_hsv=True)
-    show_samples(test_ds, 4, 8, title='From the test set', use_hsv=True)
+    show_samples(train_ds, 4, 4, title='From the training set', use_hsv=use_hsv)
+    show_samples(val_ds, 4, 8, title='From the validation set', use_hsv=use_hsv)
+    show_samples(test_ds, 4, 8, title='From the test set', use_hsv=use_hsv)
 
     def compile_model(model, n_classes, learning_rate):
         if n_classes > 2:
@@ -421,8 +445,7 @@ if __name__ == '__main__':
     main()
 
 """TODO:
-If augmented images already available, do not re-do them
-Retry with grayscale
+Maximize images dynamic range
 Try a different pre-trained NN
 Parallel feeding to the NN of multiple batches
 Hyper-parameters tuning
