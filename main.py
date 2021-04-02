@@ -10,7 +10,7 @@ from matplotlib.colors import hsv_to_rgb
 import numpy as np
 
 AUTOTUNE = tf.data.AUTOTUNE
-image_size = (224, 224)
+image_size = (300, 300)
 labels = {0: 'rock', 1: 'paper', 2: 'scissors'}
 project = 'baseline'
 computation_path = 'computations/' + project
@@ -321,8 +321,8 @@ def main():
                       loss=loss,
                       metrics=[selection_metric])
 
-    def make_model_EfficientNetB0(hp, n_classes, dataset, bias_init, augment=False):
-        base_model = tf.keras.applications.EfficientNetB0(include_top=False,
+    def make_model_EfficientNet(hp, n_classes, dataset, bias_init, augment=False):
+        base_model = tf.keras.applications.EfficientNetB3(include_top=False,
                                                           weights='imagenet',
                                                           pooling=None,
                                                           input_shape=image_size + (3,),
@@ -347,7 +347,7 @@ def main():
         bias_initializer = tf.keras.initializers.Constant(bias_init) if bias_init is not None else None
         outputs = tf.keras.layers.Dense(n_classes, bias_initializer=bias_initializer)(x)
         model = tf.keras.Model(inputs, outputs)
-        compile_model(model, n_classes=n_classes, learning_rate=1e-4)
+        compile_model(model, n_classes=n_classes, learning_rate=1e-5)
         return model
 
     classes_freq = np.array(train_metadata['y'].value_counts().sort_index(), dtype=float) / len(train_metadata)
@@ -358,32 +358,34 @@ def main():
     images_only_ds = train_ds.map(lambda x, y: x, num_parallel_calls=AUTOTUNE)
     images_only_ds = images_only_ds.prefetch(buffer_size=AUTOTUNE)
 
-    model = make_model_EfficientNetB0(hp=None,
-                                      n_classes=3,
-                                      dataset=images_only_ds,
-                                      bias_init=bias_init,
-                                      augment=False)
+    model = make_model_EfficientNet(hp=None,
+                                    n_classes=3,
+                                    dataset=images_only_ds,
+                                    bias_init=bias_init,
+                                    augment=False)
     del images_only_ds  # Not needed anymore, can free memory
     model.summary()
 
-    tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=f'{computation_path}/logs/base-{str_time}', profile_batch=0)
+    tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=f'{computation_path}/logs/base-{str_time}',
+                                                    profile_batch=0,
+                                                    histogram_freq=1)
     checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(filepath=model_checkpoint,
                                                        monitor='val_sparse_categorical_accuracy',
                                                        verbose=1,
                                                        save_best_only=True,
                                                        mode='auto')
-    history = model.fit(x=train_ds,
+    """history = model.fit(x=train_ds,
                         validation_data=val_ds,
                         epochs=10,
                         verbose=1,
                         callbacks=[tensorboard_cb, checkpoint_cb],
-                        shuffle=False)
+                        shuffle=False)"""
 
     best_model = tf.keras.models.load_model(filepath=model_checkpoint, compile=True)
 
     def prepare_for_fine_tuning_efficientnetb0(model, n_classes, learning_rate):
         for layer in model.layers:
-            if layer.name == 'efficientnetb0':
+            if layer.name == 'efficientnetb3':
                 base_model = layer
                 break
         else:
@@ -398,17 +400,19 @@ def main():
             if match is not None:
                 block_ends.append(i)
                 block_end_names.append(layer.name)
-        last_frozen_layer = 5  # from 0 to 5, included
+        last_frozen_layer = 3  # from 0 to 5, included
 
         for i in range(block_ends[last_frozen_layer]):
             base_model.layers[i].trainable = False
 
         compile_model(base_model, n_classes=n_classes, learning_rate=learning_rate)
 
-    prepare_for_fine_tuning_efficientnetb0(best_model, n_classes=n_classes, learning_rate=1e-5)
+    prepare_for_fine_tuning_efficientnetb0(best_model, n_classes=n_classes, learning_rate=1e-6)
     best_model.summary()
 
-    tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=f'{computation_path}/logs/ft-{str_time}', profile_batch=0)
+    tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=f'{computation_path}/logs/ft-{str_time}',
+                                                    profile_batch=0,
+                                                    histogram_freq=1)
     checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(filepath=model_checkpoint_ft,
                                                        monitor='val_sparse_categorical_accuracy',
                                                        verbose=1,
@@ -445,7 +449,9 @@ if __name__ == '__main__':
     main()
 
 """TODO:
-Correctly try also (colour) RGB and HSV
+Check the warning "The calling iterator did not fully read the dataset being cached"
+Print the confusion matrix
+Correctly try also HSV
 Maximize images dynamic range
 Try a different pre-trained NN
 Parallel feeding to the NN of multiple batches
