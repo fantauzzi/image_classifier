@@ -450,6 +450,7 @@ if __name__ == '__main__':
 
 """TODO:
 Check the warning "The calling iterator did not fully read the dataset being cached"
+Explanation methods
 Print the confusion matrix
 Correctly try also HSV
 Maximize images dynamic range
