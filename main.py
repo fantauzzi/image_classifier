@@ -1,6 +1,7 @@
 from matplotlib import pyplot as plt
 import re
 import datetime
+import pickle
 from pathlib import Path
 import pandas as pd
 import tensorflow as tf
@@ -8,6 +9,7 @@ import tensorflow_datasets as tfds
 from sklearn.model_selection import train_test_split
 from matplotlib.colors import hsv_to_rgb
 import numpy as np
+from gradcam import make_gradcam_heatmap, save_gradcam
 
 AUTOTUNE = tf.data.AUTOTUNE
 image_size = (300, 300)
@@ -143,14 +145,19 @@ def shuffle_dataframe(df, seed=None):
 def main():
     train_batch_size = 16
     test_batch_size = 32
+    dataset = 'rock_paper_scissors'
     data_dir = '/mnt/storage/datasets'
-    preprocessed_dir = data_dir + '/rock_paper_scissors/preprocessed'
-    mispredicted_dir = data_dir + '/rock_paper_scissors/mispredicted'
-    mispredicted_dir_ft = data_dir + '/rock_paper_scissors/mispredicted_ft'
-    augmented_dir = data_dir + '/rock_paper_scissors/augmented'
+    preprocessed_dir = f'{data_dir}/{dataset}/preprocessed'
+    mispredicted_dir = f'{data_dir}/{dataset}/mispredicted'
+    mispredicted_dir_ft = f'{data_dir}/{dataset}/mispredicted_ft'
+    augmented_dir = f'{data_dir}/{dataset}/augmented'
+    gradcam_path = computation_path + '/gradcam'
     str_time = datetime.datetime.now().strftime("%m%d-%H%M%S")
     use_hsv = False
     augmentation_ratio = 3
+
+    if not Path(gradcam_path).is_dir():
+        Path(gradcam_path).mkdir(parents=True)
 
     # Empty or make the directories for mis-predicted samples. Create them if they don't exist
     for path in (mispredicted_dir, mispredicted_dir_ft):
@@ -321,7 +328,7 @@ def main():
                       loss=loss,
                       metrics=[selection_metric])
 
-    def make_model_EfficientNet(hp, n_classes, dataset, bias_init, augment=False):
+    def make_model_EfficientNet(n_classes, dataset, bias_init, stats_filepath, augment=False):
         base_model = tf.keras.applications.EfficientNetB3(include_top=False,
                                                           weights='imagenet',
                                                           pooling=None,
@@ -330,8 +337,24 @@ def main():
 
         preprocess_input = tf.keras.applications.efficientnet.preprocess_input  # This is the identity function
         base_model.trainable = False
-        assert base_model.layers[2].name == 'normalization'
-        base_model.layers[2].adapt(dataset)
+
+        normalization_layer = base_model.layers[2]
+        assert normalization_layer.name == 'normalization'
+        if Path(stats_filepath).is_file():
+            with open(stats_filepath, 'rb') as pickle_f:
+                stats = pickle.load(pickle_f)
+                normalization_layer.mean = stats['mean']
+                normalization_layer.variance = stats['variance']
+            print(f'Loaded dataset stats from file {stats_filepath}')
+        else:
+            print('Computing dataset stats')
+            normalization_layer.adapt(dataset)
+            with open(stats_filepath, 'wb') as pickle_f:
+                pickle_this = {'mean': normalization_layer.mean,
+                               'variance': normalization_layer.variance}
+                pickle.dump(pickle_this, file=pickle_f, protocol=pickle.HIGHEST_PROTOCOL)
+            print(f'Saved dataset stats in file {stats_filepath}')
+
         assert base_model.layers[1].name == 'rescaling'
         # With this change, the NN expects image pixels to be encoded in the range [0, 1]
         base_model.layers[1].scale = 1.
@@ -343,6 +366,7 @@ def main():
             x = inputs
         x = preprocess_input(x)
         x = base_model(x, training=False)
+        x = tf.keras.layers.Activation('relu', name='final_activation')(x)
         x = tf.keras.layers.GlobalAveragePooling2D()(x)
         bias_initializer = tf.keras.initializers.Constant(bias_init) if bias_init is not None else None
         outputs = tf.keras.layers.Dense(n_classes, bias_initializer=bias_initializer)(x)
@@ -358,10 +382,10 @@ def main():
     images_only_ds = train_ds.map(lambda x, y: x, num_parallel_calls=AUTOTUNE)
     images_only_ds = images_only_ds.prefetch(buffer_size=AUTOTUNE)
 
-    model = make_model_EfficientNet(hp=None,
-                                    n_classes=3,
+    model = make_model_EfficientNet(n_classes=3,
                                     dataset=images_only_ds,
                                     bias_init=bias_init,
+                                    stats_filepath=computation_path + '/model_stats.pickle',
                                     augment=False)
     del images_only_ds  # Not needed anymore, can free memory
     model.summary()
@@ -419,12 +443,12 @@ def main():
                                                        save_best_only=True,
                                                        mode='auto')
 
-    history_ft = best_model.fit(x=train_ds,
+    """history_ft = best_model.fit(x=train_ds,
                                 validation_data=val_ds,
                                 epochs=20,
                                 verbose=1,
                                 callbacks=[tensorboard_cb, checkpoint_cb],
-                                shuffle=False)
+                                shuffle=False)"""
 
     best_model_ft = tf.keras.models.load_model(filepath=model_checkpoint_ft, compile=True)
 
@@ -444,19 +468,32 @@ def main():
 
     test_metadata.apply(duplicate_if_mispredicted, axis=1)
 
+    img_array = next(iter(test_ds))[0][0].numpy()
+    # Put the image in a batch of size 1, what the model for Gra-CAM expects
+    img_array = np.expand_dims(img_array, axis=0)
+
+    heatmap = make_gradcam_heatmap(img_array=img_array,
+                                   model=best_model_ft,
+                                   last_conv_layer_name='final_activation')
+
+    gradcam_path = computation_path + '/gradcam'
+    progr = 0
+    for batch in test_ds:
+        for image in batch[0]:
+            img_array = image.numpy()
+            # Put the image in a batch of size 1, what the model for Gra-CAM expects
+            img_array = np.expand_dims(img_array, axis=0)
+            heatmap = make_gradcam_heatmap(img_array=img_array,
+                                           model=best_model_ft,
+                                           last_conv_layer_name='final_activation')
+            save_gradcam(image=image, heatmap=heatmap, cam_path='{}/{:04d}.png'.format(gradcam_path, progr))
+            progr += 1
+
 
 if __name__ == '__main__':
     main()
 
 """TODO:
-Check the warning "The calling iterator did not fully read the dataset being cached"
-Explanation methods
-Print the confusion matrix
-Correctly try also HSV
-Maximize images dynamic range
-Try a different pre-trained NN
 Parallel feeding to the NN of multiple batches
-Hyper-parameters tuning
-Try variable training rates
-Try again with grayscale images
+Try anther dataset, e.g. immaginettes
 """

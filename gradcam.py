@@ -54,7 +54,7 @@ def make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=None
     return heatmap.numpy()
 
 
-def save_and_display_gradcam(img_path, heatmap, cam_path, alpha=0.4):
+def save_gradcam(image, heatmap, cam_path, alpha=0.4):
     """
     Overlays a Grad-CAM heatmap onto an image, and saves the result.
     :param img_path: path to the given image, a string.
@@ -63,11 +63,12 @@ def save_and_display_gradcam(img_path, heatmap, cam_path, alpha=0.4):
     :param alpha: blending between the image and the heatmap, a float between 0 and 1.
     """
     # Load the original image
-    img = keras.preprocessing.image.load_img(img_path)
-    img = keras.preprocessing.image.img_to_array(img)
+    # img = keras.preprocessing.image.load_img(img_path)
+    # img = keras.preprocessing.image.img_to_array(img)
 
     # Rescale heatmap to a range 0-255
     heatmap = np.uint8(255 * heatmap)
+    image = np.uint8(255 * image)
 
     # Use jet colormap to colorize heatmap
     jet = cm.get_cmap("jet")
@@ -78,11 +79,11 @@ def save_and_display_gradcam(img_path, heatmap, cam_path, alpha=0.4):
 
     # Create an image with RGB colorized heatmap
     jet_heatmap = keras.preprocessing.image.array_to_img(jet_heatmap)
-    jet_heatmap = jet_heatmap.resize((img.shape[1], img.shape[0]))
+    jet_heatmap = jet_heatmap.resize((image.shape[1], image.shape[0]))
     jet_heatmap = keras.preprocessing.image.img_to_array(jet_heatmap)
 
     # Superimpose the heatmap on original image
-    superimposed_img = jet_heatmap * alpha + img
+    superimposed_img = jet_heatmap * alpha + image
     superimposed_img = keras.preprocessing.image.array_to_img(superimposed_img)
 
     # Save the superimposed image
