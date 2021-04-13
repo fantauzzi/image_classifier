@@ -10,12 +10,26 @@ from sklearn.model_selection import train_test_split
 from matplotlib.colors import hsv_to_rgb
 import numpy as np
 from gradcam import make_gradcam_heatmap, save_gradcam
+from time import time
 
 AUTOTUNE = tf.data.AUTOTUNE
 image_size = (300, 300)
-labels = {0: 'rock', 1: 'paper', 2: 'scissors'}
+labels = {}
+labels['rock_paper_scissors'] = {0: 'rock', 1: 'paper', 2: 'scissors'}
+labels['imagenette'] = {0: 'n01440764',
+                        1: 'n02102040',
+                        2: 'n02979186',
+                        3: 'n03000684',
+                        4: 'n03028079',
+                        5: 'n03394916',
+                        6: 'n03417042',
+                        7: 'n03425413',
+                        8: 'n03445777',
+                        9: 'n03888257'}
 project = 'baseline'
 computation_path = 'computations/' + project
+if not Path(computation_path).is_dir():
+    Path(computation_path).mkdir(parents=True, exist_ok=True)
 model_checkpoint = computation_path + '/models/best_base.hdf5'
 model_checkpoint_ft = computation_path + '/models/best_ft.hdf5'
 seed = 42
@@ -35,7 +49,7 @@ def show_samples(dataset, n_rows, n_cols, title, use_hsv=False):
                 image = hsv_to_rgb(image)
             axs[row, col].imshow(image)
             classification = samples[1][idx].numpy()
-            x_label = f'{classification} {labels[classification]}'
+            x_label = f'{classification} {labels[dataset][classification]}'
             y_label = ''
             idx += 1
             axs[row, col].set_xticks([])
@@ -145,16 +159,19 @@ def shuffle_dataframe(df, seed=None):
 def main():
     train_batch_size = 16
     test_batch_size = 32
-    dataset = 'rock_paper_scissors'
+    # dataset = 'rock_paper_scissors'
+    dataset = 'imagenette'
     data_dir = '/mnt/storage/datasets'
     preprocessed_dir = f'{data_dir}/{dataset}/preprocessed'
     mispredicted_dir = f'{data_dir}/{dataset}/mispredicted'
     mispredicted_dir_ft = f'{data_dir}/{dataset}/mispredicted_ft'
     augmented_dir = f'{data_dir}/{dataset}/augmented'
-    gradcam_path = computation_path + '/gradcam'
+    gradcam_path = f'{data_dir}/{dataset}/gradcam'
     str_time = datetime.datetime.now().strftime("%m%d-%H%M%S")
     use_hsv = False
-    augmentation_ratio = 3
+    augmentation_ratio = 0
+    splits = {'rock_paper_scissors': ('train', 'test'),
+              'imagenette': ('train', 'validation')}
 
     if not Path(gradcam_path).is_dir():
         Path(gradcam_path).mkdir(parents=True)
@@ -168,15 +185,15 @@ def main():
             existing_path.unlink(missing_ok=False)
 
     # Pre-process the dataset images and save them in `preprocessed_dir`. Store the related metadata in dataframes.
-    orig_train_ds, orig_train_ds_info = tfds.load('rock_paper_scissors',
-                                                  split='train',
+    orig_train_ds, orig_train_ds_info = tfds.load(dataset,
+                                                  split=splits[dataset][0],
                                                   batch_size=None,
                                                   shuffle_files=False,
                                                   data_dir=data_dir,
                                                   with_info=True)
 
-    orig_test_ds, orig_test_ds_info = tfds.load('rock_paper_scissors',
-                                                split='test',
+    orig_test_ds, orig_test_ds_info = tfds.load(dataset,
+                                                split=splits[dataset][1],
                                                 batch_size=None,
                                                 shuffle_files=False,
                                                 data_dir=data_dir,
@@ -229,8 +246,8 @@ def main():
                                         convert_to_grayscale=False)
         print(f'Saved {prepr_test} pre-processed test images {preprocessed_dir}')
 
-    train_ds_size = orig_train_ds_info.splits['train'].num_examples
-    test_ds_size = orig_test_ds_info.splits['test'].num_examples
+    train_ds_size = orig_train_ds_info.splits[splits[dataset][0]].num_examples
+    test_ds_size = orig_test_ds_info.splits[splits[dataset][1]].num_examples
 
     del orig_train_ds, orig_test_ds  # Not needed anymore, can free memory
 
@@ -254,6 +271,8 @@ def main():
         return filepath, y, augmented_filepath
 
     def augment(metadata, ratio):
+        if ratio == 0:
+            return metadata
         augmented_all = None  # Just to avoid bogus warning from IntelliJ
         for i in range(ratio):
             augmented = metadata.copy()
@@ -312,9 +331,9 @@ def main():
                             hsv_color_space=use_hsv,
                             batch_size=test_batch_size)
 
-    show_samples(train_ds, 4, 4, title='From the training set', use_hsv=use_hsv)
-    show_samples(val_ds, 4, 8, title='From the validation set', use_hsv=use_hsv)
-    show_samples(test_ds, 4, 8, title='From the test set', use_hsv=use_hsv)
+    # show_samples(train_ds, 4, 4, title='From the training set', use_hsv=use_hsv)
+    # show_samples(val_ds, 4, 8, title='From the validation set', use_hsv=use_hsv)
+    # show_samples(test_ds, 4, 8, title='From the test set', use_hsv=use_hsv)
 
     def compile_model(model, n_classes, learning_rate):
         if n_classes > 2:
@@ -382,7 +401,7 @@ def main():
     images_only_ds = train_ds.map(lambda x, y: x, num_parallel_calls=AUTOTUNE)
     images_only_ds = images_only_ds.prefetch(buffer_size=AUTOTUNE)
 
-    model = make_model_EfficientNet(n_classes=3,
+    model = make_model_EfficientNet(n_classes=n_classes,
                                     dataset=images_only_ds,
                                     bias_init=bias_init,
                                     stats_filepath=computation_path + '/model_stats.pickle',
@@ -398,12 +417,16 @@ def main():
                                                        verbose=1,
                                                        save_best_only=True,
                                                        mode='auto')
-    """history = model.fit(x=train_ds,
+
+    start_time = time()
+    history = model.fit(x=train_ds,
                         validation_data=val_ds,
-                        epochs=10,
+                        epochs=3,
                         verbose=1,
                         callbacks=[tensorboard_cb, checkpoint_cb],
-                        shuffle=False)"""
+                        shuffle=False)
+    duration = round(time()- start_time)
+    print(f'Training of base model completed in {duration} seconds.')
 
     best_model = tf.keras.models.load_model(filepath=model_checkpoint, compile=True)
 
@@ -443,12 +466,15 @@ def main():
                                                        save_best_only=True,
                                                        mode='auto')
 
-    """history_ft = best_model.fit(x=train_ds,
+    start_time = time()
+    history_ft = best_model.fit(x=train_ds,
                                 validation_data=val_ds,
-                                epochs=20,
+                                epochs=5,
                                 verbose=1,
                                 callbacks=[tensorboard_cb, checkpoint_cb],
-                                shuffle=False)"""
+                                shuffle=False)
+    duration = round(time()- start_time)
+    print(f'Fine-tuning completed in {duration} seconds.')
 
     best_model_ft = tf.keras.models.load_model(filepath=model_checkpoint_ft, compile=True)
 
@@ -476,7 +502,7 @@ def main():
                                    model=best_model_ft,
                                    last_conv_layer_name='final_activation')
 
-    gradcam_path = computation_path + '/gradcam'
+    # gradcam_path = computation_path + '/gradcam'
     progr = 0
     for batch in test_ds:
         for image in batch[0]:
